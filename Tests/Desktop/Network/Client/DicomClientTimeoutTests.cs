@@ -310,7 +310,7 @@ namespace Dicom.Network.Client
 
                 TimeSpan streamWriteTimeout = TimeSpan.FromMilliseconds(10);
 
-                client.NetworkManager = new ConfigurableNetworkManager(() => Thread.Sleep(streamWriteTimeout));
+                client.NetworkManager = new ConfigurableNetworkManager(() => Thread.Sleep(streamWriteTimeout), () => Task.FromResult(false));
 
                 DicomResponse response = null;
 
@@ -352,7 +352,7 @@ namespace Dicom.Network.Client
 
                 TimeSpan streamWriteTimeout = TimeSpan.FromMilliseconds(1500);
 
-                client.NetworkManager = new ConfigurableNetworkManager(() => Thread.Sleep(streamWriteTimeout));
+                client.NetworkManager = new ConfigurableNetworkManager(() => Thread.Sleep(streamWriteTimeout), () => Task.FromResult(false));
 
                 DicomResponse response = null;
                 DicomRequest.OnTimeoutEventArgs onTimeoutEventArgs = null;
@@ -470,7 +470,7 @@ namespace Dicom.Network.Client
                         throw new IOException("Request 1 has arrived, we can no longer write to this stream!",
                             new SocketException());
                     }
-                });
+                }, () => Task.FromResult(false));
 
                 // Ensure requests are handled sequentially
                 client.NegotiateAsyncOps(1, 1);
@@ -536,6 +536,7 @@ namespace Dicom.Network.Client
             using (CreateServer<InMemoryDicomCStoreProvider>(port))
             {
                 var client = CreateClient(port);
+                
 
                 var request1HasArrived = false;
                 client.NetworkManager = new ConfigurableNetworkManager(() =>
@@ -544,7 +545,7 @@ namespace Dicom.Network.Client
                     {
                         throw new Exception("Request 1 has arrived, we can no longer write to this stream!");
                     }
-                });
+                }, () => Task.FromResult(false));
 
                 // Ensure requests are handled sequentially
                 client.NegotiateAsyncOps(1, 1);
@@ -598,6 +599,117 @@ namespace Dicom.Network.Client
             Assert.Null(timeout3);
         }
 
+        [Fact]
+        public async Task SendAsync_ServerCrash_ShouldNotLoopInfinitely()
+        {
+            var port = Ports.GetNext();
+            var logger = _logger.IncludePrefix("UnitTest");
+
+            DicomCStoreResponse response1 = null, response2 = null, response3 = null;
+            DicomRequest.OnTimeoutEventArgs timeout1 = null, timeout2 = null, timeout3 = null;
+
+            using (var server = CreateServer<InMemoryDicomCStoreProvider>(port))
+            {
+                var client = CreateClient(port);
+                //client.Options.LogDataPDUs = true;
+                //client.Options.RequestTimeout = TimeSpan.FromSeconds(8);
+                
+
+                var response1Received = false;
+                var thrown = false;
+                var stillWritingAfterThrow = false;
+                Func<Task> onRead = async () =>
+                {
+                    if (response1Received && !thrown)
+                    {
+                        thrown = true;
+                        throw new IOException("Fail", new SocketException(10060));
+                    }
+
+                    if (thrown)
+                    {
+                        throw new IOException("Fail", new SocketException(10054));
+                    }
+                };
+                Action onStreamWrite = () =>
+                {
+                    if (thrown)
+                    {
+                        stillWritingAfterThrow = true;
+                        throw new IOException("Fail", new SocketException(10054));
+                    }
+                };
+                client.NetworkManager = new ConfigurableNetworkManager(onStreamWrite, onRead);
+
+                //Bug only occurs when asyncOps > 1
+                client.NegotiateAsyncOps(0, 0);
+
+                // Size = 5 192 KB, one PDU = 16 KB, so this will result in 325 PDUs
+                // If stream timeout = 1500ms, then total time to send will be 325 * 1500 = 487.5 seconds
+                var request1 = new DicomCStoreRequest(@"./Test Data/10200904.dcm")
+                {
+                    OnResponseReceived = (req, res) =>
+                    {
+                        response1Received = true;
+                        response1 = res;
+                    },
+                    OnTimeout = (sender, args) =>
+                    {
+                        timeout1 = args;
+                    }
+                };
+                var request2 = new DicomCStoreRequest(@"./Test Data/10200904.dcm")
+                {
+                    OnResponseReceived = (req, res) => response2 = res,
+                    OnTimeout = (sender, args) =>
+                    {
+                        timeout2 = args;
+                    }
+                };
+                var request3 = new DicomCStoreRequest(@"./Test Data/10200904.dcm")
+                {
+                    OnResponseReceived = (req, res) => response3 = res,
+                    OnTimeout = (sender, args) => timeout3 = args
+                };
+
+                await client.AddRequestsAsync(request1, request2, request3).ConfigureAwait(false);
+
+                //var sendTask = client.SendAsync();
+                //var sendTimeoutCancellationTokenSource = new CancellationTokenSource();
+                //var sendTimeout = Task.Delay(TimeSpan.FromSeconds(15), sendTimeoutCancellationTokenSource.Token);
+
+                //var winner = await Task.WhenAny(sendTask, sendTimeout).ConfigureAwait(false);
+
+                //Assert.Equal(sendTask, winner);
+
+                using (var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
+                {
+                    Exception exception = null;
+                    Task winner = null;
+                    Task sendTask = null;
+                    try
+                    {
+                        sendTask = client.SendAsync(cancellation.Token, DicomClientCancellationMode.ImmediatelyAbortAssociation);
+                        var sendTimeout = Task.Delay(TimeSpan.FromMinutes(1));
+                        winner = await Task.WhenAny(sendTask, sendTimeout).ConfigureAwait(false);
+                        if (winner == sendTask)
+                            await sendTask;
+
+                    }
+                    catch (Exception e)
+                    {
+                        exception = e;
+                    }
+
+                    Assert.NotNull(winner);
+                    Assert.NotNull(sendTask);
+                    Assert.True(winner == sendTask, "send Task was not canceled from the Cancellation Token");
+                    Assert.NotNull(exception);
+                    Assert.False(cancellation.IsCancellationRequested, "The DicomClient had to be cancelled, this indicates it was stuck in an infinite loop");
+                }
+            }
+        }
+
         #endregion
 
         #region Support classes
@@ -605,10 +717,12 @@ namespace Dicom.Network.Client
         private class ConfigurableNetworkManager : DesktopNetworkManager
         {
             private readonly Action _onStreamWrite;
+            private readonly Func<Task> _onStreamReadAsync;
 
-            public ConfigurableNetworkManager(Action onStreamWrite)
+            public ConfigurableNetworkManager(Action onStreamWrite, Func<Task> onStreamReadAsync)
             {
                 _onStreamWrite = onStreamWrite ?? throw new ArgumentNullException(nameof(onStreamWrite));
+                _onStreamReadAsync = onStreamReadAsync;
             }
 
             protected internal override INetworkStream CreateNetworkStreamImpl(string host, int port, bool useTls, bool noDelay, bool ignoreSslPolicyErrors,
@@ -616,6 +730,7 @@ namespace Dicom.Network.Client
             {
                 return new ConfigurableDesktopNetworkStreamDecorator(
                     _onStreamWrite,
+                    _onStreamReadAsync,
                     new DesktopNetworkStream(host, port, useTls, noDelay, ignoreSslPolicyErrors, millisecondsTimeout)
                 );
             }
@@ -624,11 +739,14 @@ namespace Dicom.Network.Client
         private class ConfigurableDesktopNetworkStreamDecorator : INetworkStream
         {
             private readonly Action _onStreamWrite;
+            private readonly Func<Task> _onStreamReadAsync;
             private readonly DesktopNetworkStream _desktopNetworkStream;
 
-            public ConfigurableDesktopNetworkStreamDecorator(Action onStreamWrite, DesktopNetworkStream desktopNetworkStream)
+            public ConfigurableDesktopNetworkStreamDecorator(Action onStreamWrite, Func<Task> onStreamReadAsync,
+                DesktopNetworkStream desktopNetworkStream)
             {
                 _onStreamWrite = onStreamWrite ?? throw new ArgumentNullException(nameof(onStreamWrite));
+                _onStreamReadAsync = onStreamReadAsync;
                 _desktopNetworkStream = desktopNetworkStream;
             }
 
@@ -647,19 +765,22 @@ namespace Dicom.Network.Client
 
             public Stream AsStream()
             {
-                return new ConfigurableStreamDecorator(_onStreamWrite, (NetworkStream) _desktopNetworkStream.AsStream());
+                return new ConfigurableStreamDecorator(_onStreamWrite, _onStreamReadAsync, (NetworkStream) _desktopNetworkStream.AsStream());
             }
         }
 
         private class ConfigurableStreamDecorator : Stream
         {
             private readonly Action _onStreamWrite;
+            private readonly Func<Task> _onStreamReadAsync;
             private readonly NetworkStream _inner;
 
-            public ConfigurableStreamDecorator(Action onStreamWrite, NetworkStream inner)
+            public ConfigurableStreamDecorator(Action onStreamWrite, Func<Task> onStreamReadAsync, NetworkStream inner)
             {
                 _onStreamWrite = onStreamWrite ?? throw new ArgumentNullException(nameof(onStreamWrite));
+                _onStreamReadAsync = onStreamReadAsync;
                 _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+                _inner.ReadTimeout = 10;
             }
 
             public override void Flush() => _inner.Flush();
@@ -722,9 +843,10 @@ namespace Dicom.Network.Client
                 return _inner.EndRead(asyncResult);
             }
 
-            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             {
-                return _inner.ReadAsync(buffer, offset, count, cancellationToken);
+                await _onStreamReadAsync();
+                return await _inner.ReadAsync(buffer, offset, count, cancellationToken);
             }
 
             public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
@@ -965,6 +1087,51 @@ namespace Dicom.Network.Client
             }
         }
 
+        private class FailFastDicomServer : DicomService, IDicomServiceProvider, IDicomCStoreProvider
+        {
+            public FailFastDicomServer(INetworkStream stream, Encoding fallbackEncoding, Logger log) : base(stream, fallbackEncoding, log)
+            {
+            }
+
+            public void OnReceiveAbort(DicomAbortSource source, DicomAbortReason reason)
+            {
+                
+            }
+
+            public void OnConnectionClosed(Exception exception)
+            {
+                
+            }
+
+            public Task OnReceiveAssociationRequestAsync(DicomAssociation association)
+            {
+                foreach (var presentationContext in association.PresentationContexts)
+                {
+                    foreach (var ts in presentationContext.GetTransferSyntaxes())
+                    {
+                        presentationContext.SetResult(DicomPresentationContextResult.Accept, ts);
+                        break;
+                    }
+                }
+
+                return SendAssociationAcceptAsync(association);
+            }
+
+            public Task OnReceiveAssociationReleaseRequestAsync()
+            {
+                return SendAssociationReleaseResponseAsync();
+            }
+
+            public DicomCStoreResponse OnCStoreRequest(DicomCStoreRequest request)
+            {
+                return new DicomCStoreResponse(request, DicomStatus.Success);
+            }
+
+            public void OnCStoreRequestException(string tempFileName, Exception e)
+            {
+                
+            }
+        }
         #endregion
     }
 }
