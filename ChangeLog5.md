@@ -3,6 +3,7 @@
 * Fixed bug where anonymization threw an exception if a DicomTag of VR UI contained no value (#1308)
 * Catch exception in logmessage, to avoid making the application crash because of logging (#1288)
 * Fixed StreamByteBuffer to read an internally buffered stream completely (#1313)
+* Validate calling AE and called AE length when creating a DicomClient (#1323)
 
 #### 5.0.2 (2022-01-11)
 * Update to DICOM Standard 2021e
